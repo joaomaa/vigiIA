@@ -6,6 +6,8 @@ import numpy as np
 import os
 import av
 import time
+import pandas as pd
+from datetime import datetime
 from ultralytics import YOLO
 from sort import *
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
@@ -21,7 +23,6 @@ st.markdown(
     [data-testid="stSidebar"][aria-expanded="true"] > div:first-child{width: 350px;}
     [data-testid="stSidebar"][aria-expanded="false"] > div:first-child{width: 350px; margin-left: -350px}
     
-    /* Estilo dos Cards (KPIs) */
     .kpi-card {
         background-color: #f0f2f6;
         padding: 20px;
@@ -37,12 +38,33 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Inicializar estado da webcam
-if "webcam_ativa" not in st.session_state:
-    st.session_state["webcam_ativa"] = False
+# Inicializar estado da execução
+if "run_camera" not in st.session_state:
+    st.session_state["run_camera"] = False
+
+# Arquivo para salvar histórico
+CSV_FILE = "historico_contagem.csv"
 
 # ==========================================
-# 2. CLASSE PROCESSADORA (WEBCAM)
+# 2. FUNÇÃO DE PERSISTÊNCIA (CSV)
+# ==========================================
+def salvar_contagem(classe_obj):
+    """Salva a data, hora e classe detectada no CSV."""
+    agora = datetime.now()
+    novo_dado = pd.DataFrame({
+        "Data": [agora.strftime("%Y-%m-%d")],
+        "Hora": [agora.strftime("%H:%M:%S")],
+        "Classe": [classe_obj],
+        "Contagem": [1]
+    })
+    
+    if not os.path.isfile(CSV_FILE):
+        novo_dado.to_csv(CSV_FILE, index=False)
+    else:
+        novo_dado.to_csv(CSV_FILE, mode='a', header=False, index=False)
+
+# ==========================================
+# 3. CLASSE PROCESSADORA (WEBCAM)
 # ==========================================
 class VideoProcessor:
     def __init__(self):
@@ -50,7 +72,6 @@ class VideoProcessor:
         self.tracker = Sort(max_age=25, min_hits=3, iou_threshold=0.3)
         self.totalCount = []
         
-        # Variáveis compartilhadas
         self.active_count = 0
         self.frame_width = 0
         self.frame_height = 0
@@ -69,7 +90,6 @@ class VideoProcessor:
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        
         height, width, _ = img.shape
         self.frame_width = width
         self.frame_height = height
@@ -77,7 +97,6 @@ class VideoProcessor:
         line_pos = int(height * (self.line_height_perc / 100))
         offset = self.sensitivity
 
-        # --- DETECÇÃO ---
         results = self.model(img, stream=True, verbose=False)
         detections = np.empty((0, 5))
 
@@ -94,7 +113,6 @@ class VideoProcessor:
                     currentArray = np.array([x1, y1, x2, y2, conf])
                     detections = np.vstack((detections, currentArray))
 
-        # --- RASTREAMENTO ---
         resultsTracker = self.tracker.update(detections)
         self.active_count = len(resultsTracker)
 
@@ -104,12 +122,13 @@ class VideoProcessor:
             w, h = x2 - x1, y2 - y1
             cx, cy = x1 + w // 2, y1 + h // 2
             
-            color_box = (255, 0, 255) # Magenta
+            color_box = (255, 0, 255)
 
-            # Lógica de Contagem (Invisível)
+            # Lógica Invisível
             if line_pos - offset < cy < line_pos + offset:
                 if self.totalCount.count(id) == 0:
                     self.totalCount.append(id)
+                    salvar_contagem("Webcam_Detect") # Salva no CSV
                     color_box = (0, 255, 0)
                     cv2.circle(img, (cx, cy), 15, (0, 255, 0), cv2.FILLED)
             
@@ -119,19 +138,21 @@ class VideoProcessor:
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ==========================================
-# 3. FUNÇÃO ARQUIVO DE VÍDEO
+# 4. FUNÇÃO GENÉRICA (VÍDEO E IP CAMERA)
 # ==========================================
-def process_video_file(video_path, confidence_threshold, classes_to_track, line_height_perc, sensitivity):
+def process_stream_source(source_path, confidence_threshold, classes_to_track, line_height_perc, sensitivity, is_ip_camera=False):
+    """Processa tanto arquivos de vídeo quanto Streams RTSP/HTTP"""
     model = YOLO('yolov8n.pt') 
     classNames = model.names
     tracker = Sort(max_age=25, min_hits=3, iou_threshold=0.3)
-    cap = cv2.VideoCapture(video_path)
+    
+    cap = cv2.VideoCapture(source_path)
     
     if not cap.isOpened():
-        st.error(f"Erro ao abrir vídeo: {video_path}")
+        st.error(f"Erro ao conectar na fonte: {source_path}")
+        st.session_state["run_camera"] = False
         return
 
-    # Layout KPIs
     kpi1, kpi2, kpi3 = st.columns(3)
     with kpi1: kpi1_ph = st.empty()
     with kpi2: kpi2_ph = st.empty()
@@ -148,12 +169,17 @@ def process_video_file(video_path, confidence_threshold, classes_to_track, line_
     line_pos = int(height * (line_height_perc / 100))
     offset = sensitivity 
 
-    # Botão de Parar (Aparece abaixo do iniciar enquanto roda)
-    stop_bt = st.sidebar.button("⏹️ Parar Vídeo")
-
-    while cap.isOpened() and not stop_bt:
+    # Botão de Parar (Controlado pelo Session State ou Botão Sidebar)
+    # Para Video/IP, verificamos o session_state definido pelos botões
+    
+    while cap.isOpened() and st.session_state["run_camera"]:
         success, img = cap.read()
-        if not success: break
+        if not success:
+            if not is_ip_camera: # Se for arquivo e acabou
+                break
+            else: # Se for IP e caiu, tenta reconectar ou sai
+                st.warning("Sinal da câmera perdido.")
+                break
         
         results = model(img, stream=True, verbose=False)
         detections = np.empty((0, 5))
@@ -182,14 +208,15 @@ def process_video_file(video_path, confidence_threshold, classes_to_track, line_
             
             color_box = (255, 0, 255)
             
-            # Lógica VISÍVEL para arquivo de vídeo
             if line_pos - offset < cy < line_pos + offset:
                 if totalCount.count(id) == 0:
                     totalCount.append(id)
+                    salvar_contagem(currentClass if 'currentClass' in locals() else "Objeto")
                     color_box = (0, 255, 0)
                     cv2.circle(img, (cx, cy), 15, (0, 255, 0), cv2.FILLED)
                     cv2.line(img, (0, line_pos), (width, line_pos), (0, 255, 0), 4)
 
+            # Desenha linha VISÍVEL (Padrão para Arquivo e IP Camera)
             if color_box != (0, 255, 0):
                  cv2.line(img, (0, line_pos), (width, line_pos), (0, 0, 255), 2)
 
@@ -203,133 +230,184 @@ def process_video_file(video_path, confidence_threshold, classes_to_track, line_
         stframe.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
 
     cap.release()
+    st.session_state["run_camera"] = False # Reseta estado ao sair
 
 # ==========================================
-# 4. INTERFACE PRINCIPAL
+# 5. DASHBOARD (GRÁFICOS)
+# ==========================================
+def show_dashboard():
+    st.header("📊 Histórico de Detecções")
+    if os.path.isfile(CSV_FILE):
+        df = pd.read_csv(CSV_FILE)
+        
+        # Filtros
+        col1, col2 = st.columns(2)
+        with col1:
+            datas = df['Data'].unique()
+            data_selecionada = st.selectbox("Selecione a Data:", datas)
+        
+        df_filtered = df[df['Data'] == data_selecionada]
+        
+        # Gráfico de Barras por Hora
+        st.subheader(f"Fluxo Horário - {data_selecionada}")
+        df_filtered['Hora_Short'] = df_filtered['Hora'].apply(lambda x: x.split(':')[0] + 'h')
+        hourly_counts = df_filtered.groupby('Hora_Short')['Contagem'].sum().reset_index()
+        st.bar_chart(hourly_counts, x="Hora_Short", y="Contagem", color="#FF4B4B")
+        
+        # Métricas Totais
+        total_dia = df_filtered['Contagem'].sum()
+        st.metric("Total Detectado no Dia", total_dia)
+        
+        with st.expander("Ver Dados Brutos"):
+            st.dataframe(df_filtered)
+    else:
+        st.info("Nenhum dado histórico encontrado ainda. Inicie o monitoramento para gerar dados.")
+
+# ==========================================
+# 6. INTERFACE PRINCIPAL
 # ==========================================
 def main():
     st.title("VigiIA - Sistema de Contagem Inteligente")
     st.markdown("Secretaria Municipal de Ciência, Tecnologia e Inovação")
-    st.markdown("---")
     
-    DEFAULT_VIDEO = "video_padrao.mp4"
-    final_video_path = None
+    # Abas principais
+    tab_monitor, tab_dash = st.tabs(["🎥 Monitoramento", "📈 Relatórios"])
 
-    # --- MENU 1: FONTE ---
-    with st.sidebar.expander("📹 Fonte de Vídeo", expanded=True):
-        source_radio = st.radio("Escolha a Entrada:", ["Arquivo de Vídeo", "Webcam (Ao Vivo)"])
-        
-        video_file_buffer = None
-        if source_radio == "Arquivo de Vídeo":
-            st.caption("Faça upload ou use o vídeo demonstrativo automático.")
-            video_file_buffer = st.file_uploader("Upload MP4/AVI (Opcional)", type=["mp4", "avi", "mov"])
+    with tab_monitor:
+        st.markdown("---")
+        DEFAULT_VIDEO = "video_padrao.mp4"
+        final_source = None
+        is_ip_cam = False
 
-    st.sidebar.markdown("---")
-
-    # --- MENU 2: CONFIGURAÇÕES IA ---
-    st.sidebar.header("🧠 Inteligência Artificial")
-    default_classes = ["person", "car", "bus", "truck", "motorbike"]
-    assigned_class = st.sidebar.multiselect("Objetos para contar:", default_classes, default=["person"])
-    confidence = st.sidebar.slider('Confiança Mínima', 0.0, 1.0, 0.40)
-    
-    st.sidebar.markdown("---")
-    
-    # --- MENU 3: CALIBRAGEM ---
-    st.sidebar.header("📏 Calibragem da Linha")
-    st.sidebar.info("Ajuste a linha azul virtual para onde o fluxo de pessoas/veículos passa.")
-    line_height = st.sidebar.slider('Posição Vertical (%)', 0, 100, 50)
-    sensitivity = st.sidebar.slider('Sensibilidade de Detecção', 10, 100, 40)
-
-    st.sidebar.markdown("---")
-    st.sidebar.header("🚀 Execução")
-
-    # ===============================
-    # 1. MODO WEBCAM
-    # ===============================
-    if source_radio == "Webcam (Ao Vivo)":
-        
-        # --- LÓGICA DOS BOTÕES IGUAL A IMAGEM ---
-        
-        # 1. Botão Iniciar (Vermelho/Primary)
-        # Sempre visível para reiniciar ou começar
-        if st.sidebar.button("▶️ Iniciar Processamento", type="primary"):
-            st.session_state["webcam_ativa"] = True
-            st.rerun() # Atualiza a tela para processar
+        # --- MENU 1: FONTE ---
+        with st.sidebar.expander("📹 Fonte de Vídeo", expanded=True):
+            source_radio = st.radio("Escolha a Entrada:", 
+                                  ["Arquivo de Vídeo", "Webcam (Ao Vivo)", "Câmera IP (RTSP)"])
             
-        # 2. Botão Parar (Branco/Secondary)
-        # Só aparece (empilhado embaixo) se a webcam estiver ativa
-        if st.session_state["webcam_ativa"]:
+            video_file_buffer = None
+            rtsp_url = None
+
+            if source_radio == "Arquivo de Vídeo":
+                st.caption("Faça upload ou use o vídeo demonstrativo.")
+                video_file_buffer = st.file_uploader("Upload MP4/AVI", type=["mp4", "avi"])
+            
+            elif source_radio == "Câmera IP (RTSP)":
+                st.caption("Ex: rtsp://admin:12345@192.168.0.1:554/stream")
+                rtsp_url = st.text_input("URL da Câmera:")
+
+        st.sidebar.markdown("---")
+
+        # --- MENU 2: CONFIGURAÇÕES IA ---
+        st.sidebar.header("🧠 Inteligência Artificial")
+        default_classes = ["person", "car", "bus", "truck", "motorbike"]
+        assigned_class = st.sidebar.multiselect("Objetos para contar:", default_classes, default=["person"])
+        confidence = st.sidebar.slider('Confiança Mínima', 0.0, 1.0, 0.40)
+        
+        st.sidebar.markdown("---")
+        
+        # --- MENU 3: CALIBRAGEM ---
+        st.sidebar.header("📏 Calibragem da Linha")
+        line_height = st.sidebar.slider('Posição Vertical (%)', 0, 100, 50)
+        sensitivity = st.sidebar.slider('Sensibilidade', 10, 100, 40)
+
+        st.sidebar.markdown("---")
+        st.sidebar.header("🚀 Execução")
+
+        # =====================================
+        # LÓGICA DE CONTROLE (BOTÕES SIDEBAR)
+        # =====================================
+        
+        # Botões Iniciar/Parar Padrão para TODOS os modos (Exceto WebRTC que tem controle próprio interno)
+        # Vamos padronizar: Botões controlam o st.session_state["run_camera"]
+        
+        col_btn1, col_btn2 = st.sidebar.columns(2)
+        
+        # Só mostramos os botões se NÃO for WebRTC (ele tem lógica separada para usar a API nativa)
+        # Mas para ficar uniforme visualmente, faremos um wrapper.
+        
+        btn_iniciar = False
+        btn_parar = False
+        
+        # Botão Iniciar (Vermelho)
+        if st.sidebar.button("▶️ Iniciar Processamento", type="primary"):
+            st.session_state["run_camera"] = True
+            st.rerun()
+
+        # Botão Parar (Branco) - Só aparece se estiver rodando
+        if st.session_state["run_camera"]:
             if st.sidebar.button("⏹️ Parar Vídeo"):
-                st.session_state["webcam_ativa"] = False
+                st.session_state["run_camera"] = False
                 st.rerun()
 
-        # Layout dos Cards
-        kpi1, kpi2, kpi3 = st.columns(3)
-        with kpi1: kpi1_ph = st.empty()
-        with kpi2: kpi2_ph = st.empty()
-        with kpi3: kpi3_ph = st.empty()
-
-        # Placeholders iniciais
-        kpi1_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Ativos Agora</div><div class="kpi-value">0</div></div>', unsafe_allow_html=True)
-        kpi2_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Resolução</div><div class="kpi-value">-</div></div>', unsafe_allow_html=True)
-        kpi3_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Total Contado</div><div class="kpi-value" style="color:red">0</div></div>', unsafe_allow_html=True)
-
-        if st.session_state["webcam_ativa"]:
-            st.header("Webcam em Tempo Real")
+        # ===============================
+        # PROCESSAMENTO
+        # ===============================
+        
+        if st.session_state["run_camera"]:
             
-            ctx = webrtc_streamer(
-                key="vigia-webcam", 
-                mode=WebRtcMode.SENDRECV, 
-                video_processor_factory=VideoProcessor,
-                media_stream_constraints={"video": True, "audio": False},
-                async_processing=True,
-                desired_playing_state=st.session_state["webcam_ativa"]
-            )
-            
-            # Loop de atualização dos KPIs
-            if ctx.video_processor:
-                ctx.video_processor.update_settings(confidence, assigned_class, line_height, sensitivity)
+            # 1. ARQUIVO DE VÍDEO
+            if source_radio == "Arquivo de Vídeo":
+                if video_file_buffer:
+                    tfflie = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+                    tfflie.write(video_file_buffer.read())
+                    final_source = tfflie.name
+                elif os.path.exists(DEFAULT_VIDEO):
+                    final_source = DEFAULT_VIDEO
                 
-                while ctx.state.playing:
-                    ativos = ctx.video_processor.active_count
-                    largura = ctx.video_processor.frame_width
-                    altura = ctx.video_processor.frame_height
-                    total = len(ctx.video_processor.totalCount)
-                    
-                    kpi1_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Ativos Agora</div><div class="kpi-value">{ativos}</div></div>', unsafe_allow_html=True)
-                    if largura > 0:
-                        kpi2_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Resolução</div><div class="kpi-value">{largura}x{altura}</div></div>', unsafe_allow_html=True)
-                    kpi3_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Total Contado</div><div class="kpi-value" style="color:red">{total}</div></div>', unsafe_allow_html=True)
-                    
-                    time.sleep(0.5)
-        else:
-            st.info("Clique em 'Iniciar Processamento' na barra lateral para ativar a câmera.")
+                if final_source:
+                    process_stream_source(final_source, confidence, assigned_class, line_height, sensitivity, is_ip_camera=False)
+                else:
+                    st.error("Nenhum vídeo carregado.")
+                    st.session_state["run_camera"] = False
 
-    # ===============================
-    # 2. MODO ARQUIVO DE VÍDEO
-    # ===============================
-    elif source_radio == "Arquivo de Vídeo":
-        
-        if video_file_buffer:
-            tfflie = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-            tfflie.write(video_file_buffer.read())
-            final_video_path = tfflie.name
-            st.success("Vídeo carregado com sucesso!")
-        else:
-            if os.path.exists(DEFAULT_VIDEO):
-                final_video_path = DEFAULT_VIDEO
-                st.info(f"Nenhum arquivo enviado. Utilizando vídeo de demonstração padrão.")
-            else:
-                st.warning("Aguardando upload... (Vídeo padrão 'video_padrao.mp4' não encontrado)")
-        
-        btn_disabled = final_video_path is None
+            # 2. CÂMERA IP
+            elif source_radio == "Câmera IP (RTSP)":
+                if rtsp_url:
+                    # Para câmeras de segurança, mantemos a linha VISÍVEL (igual arquivo)
+                    process_stream_source(rtsp_url, confidence, assigned_class, line_height, sensitivity, is_ip_camera=True)
+                else:
+                    st.error("Insira a URL RTSP da câmera.")
+                    st.session_state["run_camera"] = False
 
-        # Botão Iniciar (Mesmo estilo)
-        if st.sidebar.button("▶️ Iniciar Processamento", type="primary", disabled=btn_disabled):
-            if final_video_path:
-                process_video_file(final_video_path, confidence, assigned_class, line_height, sensitivity)
-            else:
-                st.sidebar.error("Nenhum arquivo de vídeo disponível.")
+            # 3. WEBCAM (Lógica Especial WebRTC)
+            elif source_radio == "Webcam (Ao Vivo)":
+                st.header("Webcam em Tempo Real")
+                
+                # KPIs Placeholder
+                kpi1, kpi2, kpi3 = st.columns(3)
+                with kpi1: kpi1_ph = st.empty()
+                with kpi2: kpi2_ph = st.empty()
+                with kpi3: kpi3_ph = st.empty()
+                
+                ctx = webrtc_streamer(
+                    key="vigia-webcam", 
+                    mode=WebRtcMode.SENDRECV, 
+                    video_processor_factory=VideoProcessor,
+                    media_stream_constraints={"video": True, "audio": False},
+                    async_processing=True,
+                    desired_playing_state=st.session_state["run_camera"] # Controlado pelo botão da sidebar
+                )
+                
+                if ctx.video_processor:
+                    ctx.video_processor.update_settings(confidence, assigned_class, line_height, sensitivity)
+                    while ctx.state.playing:
+                        ativos = ctx.video_processor.active_count
+                        largura = ctx.video_processor.frame_width
+                        altura = ctx.video_processor.frame_height
+                        total = len(ctx.video_processor.totalCount)
+                        
+                        kpi1_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Ativos Agora</div><div class="kpi-value">{ativos}</div></div>', unsafe_allow_html=True)
+                        if largura > 0:
+                            kpi2_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Resolução</div><div class="kpi-value">{largura}x{altura}</div></div>', unsafe_allow_html=True)
+                        kpi3_ph.markdown(f'<div class="kpi-card"><div class="kpi-title">Total Contado</div><div class="kpi-value" style="color:red">{total}</div></div>', unsafe_allow_html=True)
+                        time.sleep(0.5)
+
+        else:
+            st.info("Aguardando início do processamento...")
+
+    # Aba de Dashboard
+    with tab_dash:
+        show_dashboard()
 
 if __name__ == '__main__':
     try:
