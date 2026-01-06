@@ -5,3 +5,5 @@ numpy
 filterpy
 scikit-image
 lap
+streamlit-webrtc
+av
